@@ -12,7 +12,12 @@ Notes:
 
 [CmdletBinding()]
 param(
+  # Option A: Full path to eqgame.exe
   [string]$Path = "C:\Games\Quarm\eqgame.exe",
+
+  # Option B: Directory that contains eqgame.exe
+  [string]$EqDir,
+
   [string]$Args = "",
   [ValidateRange(16, 32768)]
   [int]$MinMB = 300,
@@ -22,6 +27,7 @@ param(
   [int]$ReapplySeconds = 15,
   [switch]$NoWait
 )
+
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -43,7 +49,18 @@ if (-not $principal.IsInRole($adminRole)) {
   exit
 }
 
-if (-not (Test-Path -LiteralPath $Path)) { throw "Not found: $Path" }
+# --- Resolve eqgame.exe path ---
+if ($EqDir) {
+  $ResolvedEqPath = Join-Path -Path $EqDir -ChildPath "eqgame.exe"
+}
+
+if (-not (Test-Path -LiteralPath $ResolvedEqPath)) {
+  throw "eqgame.exe not found at: $ResolvedEqPath"
+}
+
+$ResolvedEqPath = (Resolve-Path -LiteralPath $ResolvedEqPath).Path
+
+if (-not (Test-Path -LiteralPath $ResolvedEqPath)) { throw "Not found: $ResolvedEqPath" }
 if ($MinMB -ge $MaxMB) { throw "MinMB ($MinMB) must be less than MaxMB ($MaxMB)." }
 
 # --- Add Win32 interop once per session ---
@@ -174,10 +191,10 @@ try { [Win32]::EnablePrivilege("SeIncreaseWorkingSetPrivilege") }
 catch { Write-Warning "Could not enable SeIncreaseWorkingSetPrivilege (continuing): $($_.Exception.Message)" }
 
 # --- Launch EQ WITHOUT ShellExecute (prevents redirection to Daybreak installer) ---
-Write-Host "Launching EQ directly (no shell): $Path $Args"
+Write-Host "Launching EQ directly (no shell): $ResolvedEqPath $Args"
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
-$psi.FileName = $Path
-$psi.WorkingDirectory = Split-Path -Path $Path
+$psi.FileName = $ResolvedEqPath
+$psi.WorkingDirectory = Split-Path -Path $ResolvedEqPath
 $psi.UseShellExecute = $false
 if ($Args -and $Args.Trim().Length -gt 0) { $psi.Arguments = $Args }
 
