@@ -1,6 +1,8 @@
 # QuarmWrapper
 
-Largely made with thinking machines to help me run the `eqgame.exe` on my machine.
+Largely made with thinking machines to help me run the `eqgame.exe` on my machine. 
+
+I recommend running this in an elevated PowerShell window. The script should launch such an elevated terminal, if in a normal command prompt, but that doesn't seem to be happening at this current time.
 
 ```powershell
 eqgame-wrapper.ps1
@@ -8,7 +10,7 @@ eqgame-wrapper.ps1
 Launches Quarm eqgame.exe and applies working set min/max limits.
 
 ```powershell
-.\quarm-eqgame-wrapper.ps1 -EqDir "D:\Games\Quarm"
+.\quarm-eqgame-wrapper.ps1 -EqDir "C:\Games\Quarm"
 ```
 Launches Quarm eqgame.exe with a specified path.
 
@@ -19,7 +21,7 @@ quarm-eqgame-wrapper.ps1 -MinMB 256 -MaxMB 768 -ReapplySeconds 10
 Launches Quarm eqgame.exe with a working set between 256MB and 768MB, reapplying every 10 seconds.
 
 ```powershell
-quarm-eqgame-wrapper.ps1 -EqDir "D:\Games\Quarm" -MinMB 256 -MaxMB 768 -ReapplySeconds 10
+quarm-eqgame-wrapper.ps1 -EqDir "C:\Games\Quarm" -MinMB 256 -MaxMB 768 -ReapplySeconds 10
 ```
 Launches Quarm eqgame.exe, defining the path, and with a working set between 256MB and 768MB, reapplying every 10 seconds.
 
