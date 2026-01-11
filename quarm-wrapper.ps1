@@ -1,9 +1,6 @@
 <#
-.\eqgame-wrapper.ps1
+.\quarm-wrapper.ps1
 Launches Quarm eqgame.exe and applies working set min/max limits.
-
-.\quarm-eqgame-wrapper.ps1 -MinMB 256 -MaxMB 768 -ReapplySeconds 10
-Launches Quarm eqgame.exe with a working set between 256MB and 768MB, reapplying every 10 seconds.
 
 Notes:
 - Working set limits are not a perfect "hard cap" on total memory; they mostly influence resident RAM.
@@ -18,6 +15,10 @@ param(
   # Option B: Directory that contains eqgame.exe
   [string]$EqDir,
 
+  # How long to wait after launching EQ before applying working set limits (helps during login/server/world handoff)
+  [ValidateRange(0, 3600)]
+  [int]$InitialDelaySeconds = 45,
+
   [string]$Args = "",
   [ValidateRange(16, 32768)]
   [int]$MinMB = 300,
@@ -28,11 +29,10 @@ param(
   [switch]$NoWait
 )
 
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# --- Self-elevate early (before we launch EQ / call Add-Type) ---
+# --- Self-elevate early ---
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 $adminRole = [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -50,9 +50,9 @@ if (-not $principal.IsInRole($adminRole)) {
 }
 
 # --- Resolve eqgame.exe path ---
-if ($EqDir) {
-  $ResolvedEqPath = Join-Path -Path $EqDir -ChildPath "eqgame.exe"
-}
+$ResolvedEqPath =
+  if ($EqDir) { Join-Path -Path $EqDir -ChildPath "eqgame.exe" }
+  else { $Path }
 
 if (-not (Test-Path -LiteralPath $ResolvedEqPath)) {
   throw "eqgame.exe not found at: $ResolvedEqPath"
@@ -60,7 +60,6 @@ if (-not (Test-Path -LiteralPath $ResolvedEqPath)) {
 
 $ResolvedEqPath = (Resolve-Path -LiteralPath $ResolvedEqPath).Path
 
-if (-not (Test-Path -LiteralPath $ResolvedEqPath)) { throw "Not found: $ResolvedEqPath" }
 if ($MinMB -ge $MaxMB) { throw "MinMB ($MinMB) must be less than MaxMB ($MaxMB)." }
 
 # --- Add Win32 interop once per session ---
@@ -91,9 +90,6 @@ public static class Win32
         IntPtr dwMaximumWorkingSetSize,
         uint flags
     );
-
-    public const uint QUOTA_LIMITS_HARDWS_MIN_ENABLE = 0x00000001;
-    public const uint QUOTA_LIMITS_HARDWS_MAX_ENABLE = 0x00000002;
 
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
@@ -150,12 +146,34 @@ public static class Win32
 "@
 }
 
+# Best-effort privilege
+try { [Win32]::EnablePrivilege("SeIncreaseWorkingSetPrivilege") }
+catch { Write-Warning "Could not enable SeIncreaseWorkingSetPrivilege (continuing): $($_.Exception.Message)" }
+
+function Get-QuarmEqProcess {
+  param([Parameter(Mandatory)][string]$ExePath)
+
+  # Find eqgame.exe processes and pick the most recently started that matches our exact path.
+  $escaped = $ExePath.Replace('\', '\\')
+  $cim = Get-CimInstance Win32_Process -Filter "Name='eqgame.exe'" |
+         Where-Object { $_.ExecutablePath -eq $ExePath }
+
+  if (-not $cim) { return $null }
+
+  $newest = $cim | Sort-Object CreationDate -Descending | Select-Object -First 1
+  try { return Get-Process -Id $newest.ProcessId -ErrorAction Stop }
+  catch { return $null }
+}
+
 function Set-WorkingSetMB {
   param(
     [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
     [Parameter(Mandatory)][int]$MinMB,
     [Parameter(Mandatory)][int]$MaxMB
   )
+
+  $Process.Refresh()
+  if ($Process.HasExited) { return $false }
 
   $minBytes = [IntPtr]([int64]$MinMB * 1MB)
   $maxBytes = [IntPtr]([int64]$MaxMB * 1MB)
@@ -167,30 +185,35 @@ function Set-WorkingSetMB {
   )
 
   if ($hProc -eq [IntPtr]::Zero) {
+    # If it exited between refresh and OpenProcess, don't treat as scary
+    $Process.Refresh()
+    if ($Process.HasExited) { return $false }
+
     $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-    Write-Warning "OpenProcess failed for PID $($Process.Id). Win32Error=$code (Access Denied is common if not elevated)."
-    return
+    Write-Warning "OpenProcess failed for PID $($Process.Id). Win32Error=$code"
+    return $false
   }
 
   try {
-    $flags = [Win32]::QUOTA_LIMITS_HARDWS_MIN_ENABLE -bor [Win32]::QUOTA_LIMITS_HARDWS_MAX_ENABLE
-    $ok = [Win32]::SetProcessWorkingSetSizeEx($hProc, $minBytes, $maxBytes, $flags)
+    # flags = 0 for compatibility
+    $ok = [Win32]::SetProcessWorkingSetSizeEx($hProc, $minBytes, $maxBytes, 0)
     if (-not $ok) {
+      $Process.Refresh()
+      if ($Process.HasExited) { return $false }
+
       $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
       Write-Warning "SetProcessWorkingSetSizeEx failed for PID $($Process.Id). Win32Error=$code"
-      return
+      return $false
     }
+
+    return $true
   }
   finally {
     [void][Win32]::CloseHandle($hProc)
   }
 }
 
-# Enable privilege (best-effort)
-try { [Win32]::EnablePrivilege("SeIncreaseWorkingSetPrivilege") }
-catch { Write-Warning "Could not enable SeIncreaseWorkingSetPrivilege (continuing): $($_.Exception.Message)" }
-
-# --- Launch EQ WITHOUT ShellExecute (prevents redirection to Daybreak installer) ---
+# --- Launch EQ (no shell) ---
 Write-Host "Launching EQ directly (no shell): $ResolvedEqPath $Args"
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = $ResolvedEqPath
@@ -201,7 +224,6 @@ if ($Args -and $Args.Trim().Length -gt 0) { $psi.Arguments = $Args }
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host "Launched PID $($proc.Id)"
 
-# Apply once + verify actual image path (best-effort)
 try {
   $proc.Refresh()
   Write-Host "Actual EXE: $($proc.MainModule.FileName)"
@@ -209,30 +231,62 @@ try {
   Write-Warning "Couldn't read MainModule.FileName."
 }
 
-$apply = {
-  param($p, $min, $max)
-  $p.Refresh()
-  Set-WorkingSetMB -Process $p -MinMB $min -MaxMB $max
-  $wsNow = [Math]::Round(($p.WorkingSet64 / 1MB), 1)
-  Write-Host "Applied working set: Min=${min}MB Max=${max}MB (current ~${wsNow}MB)"
+if ($InitialDelaySeconds -gt 0) {
+  Write-Host "Waiting $InitialDelaySeconds seconds before applying working set limits..."
+  Start-Sleep -Seconds $InitialDelaySeconds
 }
 
-& $apply $proc $MinMB $MaxMB
+$apply = {
+  param([ref]$pRef, $min, $max, $exePath)
+
+  # Follow process if it swapped during world-load
+  $p = $pRef.Value
+  if ($null -eq $p -or $p.HasExited) {
+    $found = Get-QuarmEqProcess -ExePath $exePath
+    if ($found) {
+      $pRef.Value = $found
+      $p = $found
+      Write-Host "Switched to new eqgame.exe PID $($p.Id)"
+    } else {
+      Write-Host "No matching eqgame.exe process found (yet)."
+      return
+    }
+  }
+
+  $ok = Set-WorkingSetMB -Process $p -MinMB $min -MaxMB $max
+  $p.Refresh()
+  $wsNow = if ($p.HasExited) { 0 } else { [Math]::Round(($p.WorkingSet64 / 1MB), 1) }
+
+  if ($ok) {
+    Write-Host "Applied working set: Min=${min}MB Max=${max}MB (PID $($p.Id), current ~${wsNow}MB)"
+  } else {
+    Write-Host "Working set not applied (PID $($p.Id), current ~${wsNow}MB)"
+  }
+}
+
+# First apply
+$procRef = [ref]$proc
+& $apply $procRef $MinMB $MaxMB $ResolvedEqPath
 
 if ($NoWait) { return }
 
 if ($ReapplySeconds -gt 0) {
   Write-Host "Reapplying every $ReapplySeconds seconds. Ctrl+C to stop."
-  while (-not $proc.HasExited) {
+  while ($true) {
     Start-Sleep -Seconds $ReapplySeconds
-    try { & $apply $proc $MinMB $MaxMB }
-    catch {
-      if ($proc.HasExited) { break }
-      Write-Warning "Reapply failed: $($_.Exception.Message)"
-    }
+
+    # If we can't find ANY matching eqgame.exe anymore, we assume the game is done.
+    $current = $procRef.Value
+    $stillRunning =
+      ($current -and -not $current.HasExited) -or (Get-QuarmEqProcess -ExePath $ResolvedEqPath)
+
+    if (-not $stillRunning) { break }
+
+    try { & $apply $procRef $MinMB $MaxMB $ResolvedEqPath }
+    catch { Write-Warning "Reapply failed: $($_.Exception.Message)" }
   }
 } else {
-  try { $proc.WaitForExit() } catch {}
+  try { $procRef.Value.WaitForExit() } catch {}
 }
 
 Write-Host "EverQuest exited."
